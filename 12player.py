@@ -15,7 +15,7 @@ ROUNDS = 5
 POINTS_FOR_WIN = 1
 
 # --- Save config ---
-SAVE_DIR = "saves"  # all autosaves and manual exports go here
+SAVE_DIR = "saves"  # autosaves and manual exports go here
 
 # --- Deck pool (can be longer than needed) ---
 DEFAULT_DECK_POOL = [
@@ -32,6 +32,23 @@ DEFAULT_DECK_POOL = [
     "Shakespear", "Titania", "Hamlet", "Sisters",
     "Tesla", "Jill Trent", "Christmas", "Golden Bat",
     "Loki", "Pandora", "Black Beard", "Chupacabra"
+]
+
+
+# --- Maps: exactly 12 provided (1 per table, assigned randomly) ---
+DEFAULT_MAPS = [
+    "Baskerville Manor",
+    "Globe Theatre",
+    "Marmoreal",
+    "Sarpedon",
+    "Soho",
+    "Sherwood Forest",
+    "Yukon",
+    "Hanging gardens",
+    "Heorot",
+    "Santas workshop",
+    "King Solomons mine",
+    "Azuchi Castle"
 ]
 
 # ----------------------------
@@ -83,6 +100,25 @@ def deal_tables(
             used_here.add(chosen)
 
     return tables_to_decks
+
+# ----------------------------
+# Maps -> Tables (fixed once)
+# ----------------------------
+def deal_maps(
+    maps: List[str],
+    num_tables: int = NUM_TABLES,
+    rng: Optional[random.Random] = None
+) -> Dict[int, str]:
+    """Assign exactly one random UNIQUE map to each table."""
+    if rng is None:
+        rng = random.Random()
+
+    if len(maps) < num_tables:
+        raise ValueError(f"Need at least {num_tables} maps, got {len(maps)}.")
+
+    maps_shuffled = maps[:]
+    rng.shuffle(maps_shuffled)
+    return {t: maps_shuffled[t-1] for t in range(1, num_tables + 1)}
 
 # ----------------------------
 # Swiss pairing core (2-player tables)
@@ -208,13 +244,58 @@ def assign_tables_avoiding_repeats(
     return t2p, forced
 
 # ----------------------------
+# Tie-breakers (Buchholz (W-L) & H2H)
+# ----------------------------
+def compute_wins_losses_from_log(players: List[str], match_log: List[Dict]) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Count wins and losses for each player based on match_log."""
+    wins = {p: 0 for p in players}
+    losses = {p: 0 for p in players}
+    for m in match_log:
+        a, b, w = m["a"], m["b"], m["winner"]
+        wins[w] += 1
+        loser = b if w == a else a
+        losses[loser] += 1
+    return wins, losses
+
+def compute_buchholz_wl(players: List[str], match_log: List[Dict]) -> Dict[str, int]:
+    """
+    New Buchholz: for each player, sum over unique opponents of (opponent_wins - opponent_losses).
+    Uses match_log to derive opponents and each opponent's W/L.
+    """
+    opponents = defaultdict(set)
+    for m in match_log:
+        a, b = m["a"], m["b"]
+        opponents[a].add(b)
+        opponents[b].add(a)
+
+    wins, losses = compute_wins_losses_from_log(players, match_log)
+    out: Dict[str, int] = {p: 0 for p in players}
+    for p in players:
+        total = 0
+        for opp in opponents.get(p, []):
+            total += wins.get(opp, 0) - losses.get(opp, 0)
+        out[p] = total
+    return out
+
+def head_to_head(a: str, b: str, match_log: List[Dict]) -> Optional[str]:
+    """
+    Return 'a' if a beat b; 'b' if b beat a; None if they didn't play.
+    If multiple meetings exist, the LAST result is used.
+    """
+    res = None
+    for m in match_log:
+        if (m["a"] == a and m["b"] == b) or (m["a"] == b and m["b"] == a):
+            res = m["winner"]
+    return res
+
+# ----------------------------
 # Tkinter App
 # ----------------------------
 class SwissApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Swiss Tournament — 12 tables × 2 players")
-        self.geometry("1320x820")
+        self.geometry("1360x910")
 
         self.rng = random.Random()
 
@@ -227,8 +308,12 @@ class SwissApp(tk.Tk):
         self.current_table_pairs: Dict[int, Tuple[str, str]] = {}  # table -> (A,B)
         self.result_vars: Dict[int, tk.StringVar] = {}  # table -> winner strvar
         self.tables_to_decks: Dict[int, List[str]] = {}  # table -> 4 decks
+        self.tables_to_maps: Dict[int, str] = {}         # table -> 1 map
 
-        # Undo history: stack of snapshots saved BEFORE applying results
+        # Match log for tiebreaks: list of dicts {round, table, a, b, winner}
+        self.match_log: List[Dict] = []
+
+        # Undo history (for last submitted round)
         self.history: List[Dict] = []
 
         # UI
@@ -239,7 +324,7 @@ class SwissApp(tk.Tk):
         self._render_empty_pairings()
         self._render_tables_decks([])
 
-        # protocol: autosave on close
+        # autosave on close
         self.protocol("WM_DELETE_WINDOW", self._on_close_autosave_then_exit)
 
     # --------- UI LAYOUT ---------
@@ -302,16 +387,16 @@ class SwissApp(tk.Tk):
         self.round_label = tk.Label(head, text="Round: —", font=("TkDefaultFont", 12, "bold"))
         self.round_label.pack(side=tk.LEFT)
 
-        # Tables & Decks (always visible)
-        self.decks_frame = tk.LabelFrame(right, text="Tables & Decks (fixed for all rounds)")
+        # Tables & Decks/Maps (always visible)
+        self.decks_frame = tk.LabelFrame(right, text="Tables, Decks & Map (fixed for all rounds)")
         self.decks_frame.pack(fill=tk.X, pady=(8, 8))
         self.decks_tree = ttk.Treeview(
             self.decks_frame,
-            columns=("Table", "Deck 1", "Deck 2", "Deck 3", "Deck 4"),
+            columns=("Table", "Map", "Deck 1", "Deck 2", "Deck 3", "Deck 4"),
             show="headings",
-            height=6
+            height=7
         )
-        for col, w in [("Table", 70), ("Deck 1", 200), ("Deck 2", 200), ("Deck 3", 200), ("Deck 4", 200)]:
+        for col, w in [("Table", 70), ("Map", 200), ("Deck 1", 180), ("Deck 2", 180), ("Deck 3", 180), ("Deck 4", 180)]:
             self.decks_tree.heading(col, text=col)
             self.decks_tree.column(col, width=w, anchor="w")
         self.decks_tree.pack(fill=tk.X, expand=False)
@@ -320,14 +405,23 @@ class SwissApp(tk.Tk):
         self.pairings_frame = tk.LabelFrame(right, text="Current Round Pairings (select winners)")
         self.pairings_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
 
-        # Standings
+        # Standings (now with Place)
         self.standings_frame = tk.LabelFrame(right, text="Standings")
         self.standings_frame.pack(fill=tk.BOTH)
-        self.tree = ttk.Treeview(self.standings_frame, columns=("Player", "Score"), show="headings", height=12)
+        self.tree = ttk.Treeview(
+            self.standings_frame,
+            columns=("Place", "Player", "Score", "Buchholz (W-L)"),
+            show="headings",
+            height=12
+        )
+        self.tree.heading("Place", text="Place")
         self.tree.heading("Player", text="Player")
         self.tree.heading("Score", text="Score")
+        self.tree.heading("Buchholz (W-L)", text="Buchholz (W-L)")
+        self.tree.column("Place", width=70, anchor="center")
         self.tree.column("Player", width=260)
         self.tree.column("Score", width=80, anchor="center")
+        self.tree.column("Buchholz (W-L)", width=130, anchor="center")
         self.tree.pack(fill=tk.BOTH, expand=True)
 
     # --------- Player management ---------
@@ -388,15 +482,17 @@ class SwissApp(tk.Tk):
         self.scores = {p: 0 for p in self.players}
         self.prev_opponents = defaultdict(set)
         self.prev_tables = defaultdict(set)
+        self.match_log = []
         self.round_no = 0
         self.history.clear()
         self.undo_btn.config(state=tk.DISABLED)
 
-        # Deal decks to tables ONCE and render
+        # Deal decks and maps to tables ONCE and render
         try:
             self.tables_to_decks = deal_tables(DEFAULT_DECK_POOL, num_tables=NUM_TABLES, decks_per_table=4, rng=self.rng)
+            self.tables_to_maps  = deal_maps(DEFAULT_MAPS, num_tables=NUM_TABLES, rng=self.rng)
         except Exception as e:
-            messagebox.showerror("Deck dealing failed", str(e))
+            messagebox.showerror("Setup failed", str(e))
             return
         self._render_tables_decks(sorted(self.tables_to_decks.items(), key=lambda x: x[0]))
 
@@ -447,13 +543,15 @@ class SwissApp(tk.Tk):
     def _snapshot_before_submit(self):
         """Save a deep snapshot BEFORE applying results for undo."""
         snap = {
-            "round_no": self.round_no,  # this is the round being submitted
+            "round_no": self.round_no,
             "scores": copy.deepcopy(self.scores),
             "prev_opponents": {p: list(s) for p, s in self.prev_opponents.items()},
             "prev_tables": {p: list(s) for p, s in self.prev_tables.items()},
             "current_table_pairs": copy.deepcopy(self.current_table_pairs),
             "players": self.players[:],
             "tables_to_decks": copy.deepcopy(self.tables_to_decks),
+            "tables_to_maps": copy.deepcopy(self.tables_to_maps),
+            "match_log": copy.deepcopy(self.match_log),
         }
         self.history.append(snap)
 
@@ -462,7 +560,6 @@ class SwissApp(tk.Tk):
             messagebox.showinfo("Info", "No active round to submit.")
             return
 
-        # Ensure all winners selected
         winners = {}
         for t, (a, b) in self.current_table_pairs.items():
             sel = self.result_vars[t].get()
@@ -471,20 +568,19 @@ class SwissApp(tk.Tk):
                 return
             winners[t] = sel
 
-        # Save snapshot BEFORE modifying state (for Undo)
+        # Snapshot BEFORE changes (for Undo)
         self._snapshot_before_submit()
 
-        # Apply results
+        # Apply results + append to match_log
         for t, (a, b) in self.current_table_pairs.items():
             w = winners[t]
-            loser = b if w == a else a
             self.scores[w] += POINTS_FOR_WIN
             self.prev_opponents[a].add(b)
             self.prev_opponents[b].add(a)
             self.prev_tables[a].add(t)
             self.prev_tables[b].add(t)
+            self.match_log.append({"round": self.round_no, "table": t, "a": a, "b": b, "winner": w})
 
-        # Clear current round display
         self.current_table_pairs = {}
         self._render_empty_pairings()
         self._refresh_standings()
@@ -498,10 +594,8 @@ class SwissApp(tk.Tk):
             self.submit_btn.config(state=tk.DISABLED)
             self.status_var.set("Tournament finished.")
 
-        # Autosave BETWEEN rounds (after results applied)
+        # Autosave BETWEEN rounds
         self.autosave(reason="between_rounds")
-
-        # Undo remains enabled (we have snapshots)
 
     def undo_last_round(self):
         """Revert to the state BEFORE the last submitted round."""
@@ -512,22 +606,22 @@ class SwissApp(tk.Tk):
         snap = self.history.pop()
 
         # Restore state
-        self.round_no = snap["round_no"]  # back to the round being submitted
+        self.round_no = snap["round_no"]
         self.scores = snap["scores"]
         self.prev_opponents = defaultdict(set, {p: set(s) for p, s in snap["prev_opponents"].items()})
         self.prev_tables = defaultdict(set, {p: set(s) for p, s in snap["prev_tables"].items()})
         self.current_table_pairs = snap["current_table_pairs"]
         self.players = snap.get("players", self.players)
         self.tables_to_decks = snap.get("tables_to_decks", self.tables_to_decks)
+        self.tables_to_maps  = snap.get("tables_to_maps", self.tables_to_maps)
+        self.match_log = snap.get("match_log", self.match_log)
 
-        # Re-render UI for that round (so user can re-enter winners)
         self._render_tables_decks(sorted(self.tables_to_decks.items(), key=lambda x: x[0]))
         self.round_label.config(text=f"Round: {self.round_no}/{ROUNDS}")
         self._render_pairings()
         self._refresh_standings()
         self._update_players_list()
 
-        # Buttons: we are back inside an active round awaiting submission
         self.submit_btn.config(state=tk.NORMAL)
         self.pair_btn.config(state=tk.DISABLED)
         self.start_btn.config(state=tk.DISABLED)
@@ -544,7 +638,9 @@ class SwissApp(tk.Tk):
             self.prev_tables.clear()
             self.current_table_pairs.clear()
             self.tables_to_decks.clear()
+            self.tables_to_maps.clear()
             self.history.clear()
+            self.match_log.clear()
             self.round_no = 0
             self.start_btn.config(state=tk.NORMAL)
             self.pair_btn.config(state=tk.DISABLED)
@@ -562,14 +658,15 @@ class SwissApp(tk.Tk):
         """Build a JSON-serializable snapshot of the whole tournament state."""
         data = {
             "meta": {
-                "version": 1,
+                "version": 5,
                 "timestamp": timestamp(),
                 "config": {
                     "NUM_TABLES": NUM_TABLES,
                     "SEATS_PER_TABLE": SEATS_PER_TABLE,
                     "ROUNDS": ROUNDS,
                     "POINTS_FOR_WIN": POINTS_FOR_WIN,
-                }
+                },
+                "tiebreak": "buchholz_wl"  # new variant
             },
             "round_no": self.round_no,
             "players": self.players[:],
@@ -578,6 +675,8 @@ class SwissApp(tk.Tk):
             "prev_tables": {p: sorted(list(s)) for p, s in self.prev_tables.items()},
             "current_table_pairs": {int(t): list(pair) for t, pair in self.current_table_pairs.items()},
             "tables_to_decks": {int(t): decks[:] for t, decks in self.tables_to_decks.items()},
+            "tables_to_maps": {int(t): m for t, m in self.tables_to_maps.items()},
+            "match_log": [dict(m) for m in self.match_log],
         }
         return data
 
@@ -600,6 +699,10 @@ class SwissApp(tk.Tk):
         self.tables_to_decks = {
             int(t): list(decks) for t, decks in data.get("tables_to_decks", {}).items()
         }
+        self.tables_to_maps = {
+            int(t): str(m) for t, m in data.get("tables_to_maps", {}).items()
+        }
+        self.match_log = list(data.get("match_log", []))
 
     def autosave(self, reason: str):
         """Automatic save to SAVE_DIR with unique filename."""
@@ -652,22 +755,18 @@ class SwissApp(tk.Tk):
             messagebox.showerror("Load failed", f"Invalid state structure:\n{e}")
             return
 
-        # lock start; enable pair/submit depending on whether we are mid-round
         self.start_btn.config(state=tk.DISABLED)
         self.undo_btn.config(state=tk.NORMAL if self.history else tk.DISABLED)
 
         if self.current_table_pairs:
-            # mid-round: awaiting results
             self.submit_btn.config(state=tk.NORMAL)
             self.pair_btn.config(state=tk.DISABLED)
             self.status_var.set("State loaded. Re-select winners and Submit Results.")
         else:
-            # between rounds: ready to pair next
             self.submit_btn.config(state=tk.DISABLED)
             self.pair_btn.config(state=tk.NORMAL)
             self.status_var.set("State loaded. Click 'Pair Next Round'.")
 
-        # refresh UI
         self._update_players_list()
         self._refresh_standings()
         self._render_tables_decks(sorted(self.tables_to_decks.items(), key=lambda x: x[0]))
@@ -693,7 +792,8 @@ class SwissApp(tk.Tk):
             self.decks_tree.delete(i)
         for t, decks in rows:
             d = (decks + ["", "", "", ""])[:4]
-            self.decks_tree.insert("", tk.END, values=(t, d[0], d[1], d[2], d[3]))
+            m = self.tables_to_maps.get(t, "")
+            self.decks_tree.insert("", tk.END, values=(t, m, d[0], d[1], d[2], d[3]))
 
     def _render_empty_pairings(self):
         for w in self.pairings_frame.winfo_children():
@@ -718,7 +818,8 @@ class SwissApp(tk.Tk):
             row.pack(fill=tk.X, padx=8)
 
             tk.Label(row, text=str(t), width=6, anchor="w").grid(row=0, column=0, sticky="w")
-            tk.Label(row, text=f"{a}  vs  {b}", anchor="w").grid(row=0, column=1, sticky="w", padx=(10, 0))
+            map_name = self.tables_to_maps.get(t, "")
+            tk.Label(row, text=f"{a}  vs  {b}   —   Map: {map_name}", anchor="w").grid(row=0, column=1, sticky="w", padx=(10, 0))
 
             var = tk.StringVar(value="")
             self.result_vars[t] = var
@@ -727,12 +828,77 @@ class SwissApp(tk.Tk):
             tk.Radiobutton(rb_frame, text=a, variable=var, value=a).pack(side=tk.LEFT)
             tk.Radiobutton(rb_frame, text=b, variable=var, value=b).pack(side=tk.LEFT)
 
+    def _sorted_rows_for_standings(self) -> List[Tuple[str, int, int]]:
+        """
+        Return [(player, score, buchholz_wl)] sorted by:
+            Score desc, Buchholz(W-L) desc, Head-to-Head, Name
+        """
+        buch = compute_buchholz_wl(self.players, self.match_log)
+        rows = [(p, self.scores.get(p, 0), buch.get(p, 0)) for p in self.players]
+
+        # Pre-sort by score, buchholz, name; then apply H2H swaps for exact ties
+        rows.sort(key=lambda x: (-x[1], -x[2], x[0]))
+
+        i = 0
+        while i < len(rows) - 1:
+            p1, s1, b1 = rows[i]
+            p2, s2, b2 = rows[i+1]
+            if s1 == s2 and b1 == b2:
+                winner = head_to_head(p1, p2, self.match_log)
+                if winner == p2:
+                    rows[i], rows[i+1] = rows[i+1], rows[i]  # swap so winner goes above
+                    if i > 0:
+                        i -= 1
+                        continue
+            i += 1
+        return rows
+
+    def _assign_places(self, rows: List[Tuple[str, int, int]]) -> List[Tuple[int, str, int, int]]:
+        """
+        Convert sorted rows into [(place, player, score, buchholz_wl)] with competition ranking.
+        Players tie (share the same place) iff:
+          - score equal, and
+          - buchholz_wl equal, and
+          - NO head-to-head result between adjacent tied players.
+        """
+        out = []
+        if not rows:
+            return out
+
+        # helper to check if two players have an H2H result
+        def has_h2h_result(a: str, b: str) -> bool:
+            res = head_to_head(a, b, self.match_log)
+            return res in (a, b)
+
+        # first entry
+        place = 1
+        out.append((place, rows[0][0], rows[0][1], rows[0][2]))
+
+        # others
+        for idx in range(1, len(rows)):
+            p, s, b = rows[idx]
+            p_prev, s_prev, b_prev = rows[idx-1]
+
+            # same score & buchholz?
+            if s == s_prev and b == b_prev:
+                # if there is NO H2H between them, they share place
+                if not has_h2h_result(p, p_prev):
+                    out.append((place, p, s, b))
+                    continue
+
+            # otherwise new place is index+1 (competition ranking)
+            place = idx + 1
+            out.append((place, p, s, b))
+
+        return out
+
     def _refresh_standings(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
-        sorted_rows = sorted(self.scores.items(), key=lambda x: (-x[1], x[0])) if self.scores else []
-        for name, sc in sorted_rows:
-            self.tree.insert("", tk.END, values=(name, sc))
+        base_rows = self._sorted_rows_for_standings() if self.scores else []
+        placed_rows = self._assign_places(base_rows)
+        for place, name, sc, buch in placed_rows:
+            self.tree.insert("", tk.END, values=(place, name, sc, buch))
 
 
 if __name__ == "__main__":
